@@ -1,0 +1,28 @@
+{
+  "name": "gsoc-poc-appcontainer",
+  "version": "0.1.0",
+  "description": "Native Windows AppContainer sandbox driver POC for Gemini CLI (GSoC 2026)",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build:native": "node-gyp configure build",
+    "build:ts": "tsc --project tsconfig.json",
+    "build": "npm run build:native && npm run build:ts",
+    "clean": "node-gyp clean && rimraf dist",
+    "prebuild": "node -e \"if(process.platform!=='win32'){console.error('ERROR: This package only builds on Windows (requires Win32 AppContainer APIs)');process.exit(1)}\"",
+    "test": "node test/run-test.js"
+  },
+  "os": ["win32"],
+  "gypfile": true,
+  "dependencies": {
+    "node-addon-api": "^8.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "rimraf": "^5.0.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
