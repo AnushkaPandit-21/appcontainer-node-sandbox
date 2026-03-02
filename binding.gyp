@@ -3,7 +3,8 @@
     {
       "target_name": "appcontainer",
       "sources": [
-        "native/appcontainer.cc"
+        "native/appcontainer.cc",
+        "native/wfp_rules.cc"
       ],
       "include_dirs": [
         "<!(node -p \"require('path').resolve(require('node-addon-api').include_dir)\")",

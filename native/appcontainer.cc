@@ -10,6 +10,7 @@
  */
 
 #include "appcontainer.h"
+#include "wfp_rules.h"
 #include <map>
 #include <vector>
 #include <string>
@@ -30,6 +31,13 @@ static uint32_t g_nextHandleId = 1;
 // Process HANDLE store: maps uint32_t → Win32 HANDLE
 static std::map<uint32_t, HANDLE> g_processes;
 static uint32_t g_nextProcessId = 1;
+
+// WFP state: tracks the WFP engine and installed filter IDs per sandbox handle.
+struct WfpState {
+  HANDLE engineHandle = nullptr;
+  std::vector<UINT64> filterIds;
+};
+static std::map<uint32_t, WfpState> g_wfpStates;
 
 static uint32_t storeContext(AppContainerContext&& ctx) {
   uint32_t id = g_nextHandleId++;
@@ -247,29 +255,159 @@ Napi::Value SetFsAcl(const Napi::CallbackInfo& info) {
 }
 
 // ---------------------------------------------------------------------------
-// InstallWfpFilters — stub (WFP deferred to full GSoC implementation)
+// InstallWfpFilters
 // JS: installWfpFilters(handleId, rules[]) → wfpHandleId
+//
+// Opens a WFP engine, installs a block-all outbound filter for the
+// AppContainer SID, then adds high-weight allow filters for each rule.
+// Requires administrator privileges (WFP engine open will fail otherwise).
 // ---------------------------------------------------------------------------
 
 Napi::Value InstallWfpFilters(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  if (info.Length() < 1) {
+
+  if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsArray()) {
     Napi::TypeError::New(env, "installWfpFilters(handleId, rules[])").ThrowAsJavaScriptException();
     return env.Undefined();
   }
-  uint32_t handleId = info[0].As<Napi::Number>().Uint32Value();
-  // WFP implementation deferred — return handleId as the WFP handle for now.
+
+  uint32_t    handleId = info[0].As<Napi::Number>().Uint32Value();
+  Napi::Array rules    = info[1].As<Napi::Array>();
+
+  AppContainerContext* ctx = getContext(handleId);
+  if (!ctx) {
+    Napi::Error::New(env, "Invalid handle ID").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // Open the WFP engine (requires administrator privileges).
+  HANDLE hEngine = nullptr;
+  DWORD err = FwpmEngineOpen0(NULL, RPC_C_AUTHN_WINNT, NULL, NULL, &hEngine);
+  if (err != ERROR_SUCCESS) {
+    char msg[128];
+    if (err == ERROR_ACCESS_DENIED) {
+      sprintf_s(msg, "WFP requires administrator privileges (error %lu)", err);
+    } else {
+      sprintf_s(msg, "FwpmEngineOpen0 failed: error %lu", err);
+    }
+    Napi::Error::New(env, msg).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  WfpState state;
+  state.engineHandle = hEngine;
+
+  // ── Block-all outbound filter ──
+  // Low weight (1) so that the allow filters below (weight 15) take precedence.
+  FWPM_FILTER_CONDITION0 blockCond = {};
+  blockCond.fieldKey            = FWPM_CONDITION_ALE_PACKAGE_ID;
+  blockCond.matchType           = FWP_MATCH_EQUAL;
+  blockCond.conditionValue.type = FWP_SID;
+  blockCond.conditionValue.sid  = reinterpret_cast<SID*>(ctx->sid);
+
+  FWPM_FILTER0 blockFilter        = {};
+  blockFilter.layerKey             = FWPM_LAYER_ALE_AUTH_CONNECT_V4;
+  blockFilter.action.type          = FWP_ACTION_BLOCK;
+  blockFilter.numFilterConditions  = 1;
+  blockFilter.filterCondition      = &blockCond;
+  blockFilter.weight.type          = FWP_UINT8;
+  blockFilter.weight.uint8         = 1;
+
+  UINT64 blockFilterId = 0;
+  err = FwpmFilterAdd0(hEngine, &blockFilter, NULL, &blockFilterId);
+  if (err != ERROR_SUCCESS) {
+    FwpmEngineClose0(hEngine);
+    char msg[128];
+    sprintf_s(msg, "FwpmFilterAdd0 (block) failed: error %lu", err);
+    Napi::Error::New(env, msg).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  state.filterIds.push_back(blockFilterId);
+
+  // ── Allow filters for each rule ──
+  // High weight (15) so they override the block-all filter.
+  for (uint32_t i = 0; i < rules.Length(); i++) {
+    Napi::Object rule = rules.Get(i).As<Napi::Object>();
+    std::string remoteIp = rule.Get("remoteIp").As<Napi::String>().Utf8Value();
+    uint32_t remotePort  = rule.Get("remotePort").As<Napi::Number>().Uint32Value();
+
+    // Parse IPv4 address to host byte order for WFP.
+    unsigned a, b, c, d;
+    if (sscanf_s(remoteIp.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) != 4 ||
+        a > 255 || b > 255 || c > 255 || d > 255) {
+      continue; // skip invalid addresses
+    }
+    UINT32 ipHostOrder = (a << 24) | (b << 16) | (c << 8) | d;
+
+    FWPM_FILTER_CONDITION0 allowConds[3] = {};
+
+    allowConds[0].fieldKey              = FWPM_CONDITION_ALE_PACKAGE_ID;
+    allowConds[0].matchType             = FWP_MATCH_EQUAL;
+    allowConds[0].conditionValue.type   = FWP_SID;
+    allowConds[0].conditionValue.sid    = reinterpret_cast<SID*>(ctx->sid);
+
+    allowConds[1].fieldKey              = FWPM_CONDITION_IP_REMOTE_ADDRESS;
+    allowConds[1].matchType             = FWP_MATCH_EQUAL;
+    allowConds[1].conditionValue.type   = FWP_UINT32;
+    allowConds[1].conditionValue.uint32 = ipHostOrder;
+
+    allowConds[2].fieldKey              = FWPM_CONDITION_IP_REMOTE_PORT;
+    allowConds[2].matchType             = FWP_MATCH_EQUAL;
+    allowConds[2].conditionValue.type   = FWP_UINT16;
+    allowConds[2].conditionValue.uint16 = static_cast<UINT16>(remotePort);
+
+    FWPM_FILTER0 allowFilter        = {};
+    allowFilter.layerKey            = FWPM_LAYER_ALE_AUTH_CONNECT_V4;
+    allowFilter.action.type         = FWP_ACTION_PERMIT;
+    allowFilter.numFilterConditions = 3;
+    allowFilter.filterCondition     = allowConds;
+    allowFilter.weight.type         = FWP_UINT8;
+    allowFilter.weight.uint8        = 15;
+
+    UINT64 allowFilterId = 0;
+    err = FwpmFilterAdd0(hEngine, &allowFilter, NULL, &allowFilterId);
+    if (err == ERROR_SUCCESS) {
+      state.filterIds.push_back(allowFilterId);
+    }
+  }
+
+  g_wfpStates[handleId] = std::move(state);
   return Napi::Number::New(env, handleId);
 }
 
 // ---------------------------------------------------------------------------
-// RemoveWfpFilters — stub
+// RemoveWfpFilters
 // JS: removeWfpFilters(handleId) → void
+//
+// Removes all WFP filters installed by InstallWfpFilters and closes the
+// WFP engine. Best-effort — errors are ignored since this is cleanup.
 // ---------------------------------------------------------------------------
 
 Napi::Value RemoveWfpFilters(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  (void)info;
+
+  if (info.Length() < 1 || !info[0].IsNumber()) {
+    Napi::TypeError::New(env, "removeWfpFilters(handleId)").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  uint32_t handleId = info[0].As<Napi::Number>().Uint32Value();
+  auto it = g_wfpStates.find(handleId);
+  if (it == g_wfpStates.end()) return env.Undefined();
+
+  WfpState& state = it->second;
+
+  // Remove all installed filters (block + allows).
+  for (UINT64 filterId : state.filterIds) {
+    FwpmFilterDeleteById0(state.engineHandle, filterId);
+  }
+
+  // Close the WFP engine.
+  if (state.engineHandle) {
+    FwpmEngineClose0(state.engineHandle);
+  }
+
+  g_wfpStates.erase(it);
   return env.Undefined();
 }
 
@@ -516,6 +654,7 @@ Napi::Value DeleteProfile(const Napi::CallbackInfo& info) {
 // ---------------------------------------------------------------------------
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
+  // AppContainer core functions
   exports.Set("createProfile",     Napi::Function::New<CreateProfile>(env, "createProfile"));
   exports.Set("setFsAcl",          Napi::Function::New<SetFsAcl>(env, "setFsAcl"));
   exports.Set("installWfpFilters", Napi::Function::New<InstallWfpFilters>(env, "installWfpFilters"));
@@ -524,6 +663,10 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("waitForProcess",    Napi::Function::New<WaitForProcess>(env, "waitForProcess"));
   exports.Set("terminateProcess",  Napi::Function::New<TerminateContainerProcess>(env, "terminateProcess"));
   exports.Set("deleteProfile",     Napi::Function::New<DeleteProfile>(env, "deleteProfile"));
+
+  // Granular WFP functions (from wfp_rules.cc) — for testing and direct use.
+  RegisterWfpExports(env, exports);
+
   return exports;
 }
 
