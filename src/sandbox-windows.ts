@@ -22,8 +22,6 @@
  *   DeleteAppContainerProfile()           — cleans up profile on destroySandbox()
  */
 
-import { createRequire } from 'node:module';
-import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import type {
@@ -134,9 +132,8 @@ function loadNativeAddon(): NativeAddon {
     );
   }
 
-  const require = createRequire(import.meta.url);
   const addonDir = path.resolve(
-    path.dirname(fileURLToPath(import.meta.url)),
+    __dirname,
     '..',
     'build',
     'Release',

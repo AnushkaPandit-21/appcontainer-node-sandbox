@@ -83,7 +83,7 @@ export interface BuildConfigOptions {
    * If networkProfile is 'proxied', the proxy endpoint to allow.
    * Default: { remoteIp: '127.0.0.1', remotePort: 8877 }
    */
-  proxyEndpoint?: { remoteIp: string; remotePort: number };
+  proxyEndpoint?: { remoteIp: string; remotePort: number; description?: string };
 
   /**
    * Unique session identifier appended to the profile name.
@@ -143,10 +143,10 @@ export function buildConfig(opts: BuildConfigOptions): AppContainerConfig {
   const wfpAllowRules: WfpAllowRule[] | undefined =
     opts.networkProfile === 'proxied'
       ? [
-          opts.proxyEndpoint ?? {
-            remoteIp: '127.0.0.1',
-            remotePort: 8877,
-            description: 'Gemini CLI sandbox proxy',
+          {
+            remoteIp: opts.proxyEndpoint?.remoteIp ?? '127.0.0.1',
+            remotePort: opts.proxyEndpoint?.remotePort ?? 8877,
+            description: opts.proxyEndpoint?.description ?? 'Gemini CLI sandbox proxy',
           },
           // Always allow debugger port inbound (mirrors Seatbelt profiles)
           {
